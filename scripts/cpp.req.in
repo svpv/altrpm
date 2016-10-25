@@ -86,6 +86,19 @@ Cflags()
 >$tmpdir/processed
 >$tmpdir/required
 
+# We additionally pass -dI to recover missing pushes
+# due to "once-only header" optimization in gcc.
+dI=-dI
+
+# The e2k lcc preprocessor has reduced, or dare I say deficient,
+# output, without FLAGS (as in info cpp "Preprocessor Output").
+noflags=
+
+if : e2k lcc; then
+	# Not to mention -dI.
+	dI= noflags=1
+fi
+
 gcc=
 cpp=
 cxx=
@@ -120,16 +133,16 @@ CppReq()
 	cflags=$(Cflags "$f")
 	Debug "$f: cflags:" $cflags
 
-	if ! "$cpp" -w -dI $cxx $cflags "$f" >$tmpdir/out; then
+	if ! "$cpp" -w $dI $cxx $cflags "$f" >$tmpdir/out; then
 		if [ -n "$cxx" -o "$cxx_test" = failed ]; then
 			Warning "$f: cpp failed"
 			return 0
 		fi
 		Info "$f: cpp failed, trying c++ mode"
 		cxx='-x c++'
-		if ! "$cpp" -w -dI $cxx $cflags "$f" >$tmpdir/out; then
+		if ! "$cpp" -w $dI $cxx $cflags "$f" >$tmpdir/out; then
 			if [ -z "$cxx_test" ]; then
-				"$cpp" -w -dI $cxx < /dev/null > /dev/null 2>&1 &&
+				"$cpp" -w $dI $cxx < /dev/null > /dev/null 2>&1 &&
 					cxx_test=ok ||
 					cxx_test=failed
 			fi
@@ -143,7 +156,7 @@ CppReq()
 	sed -ni '/^# .* "\(\/\|<command-line>"\)/{s/"//g;p};/^#i.* ["<]/{s/[<">]//g;p}' $tmpdir/out
 
 	# Prepare the list of files in cpp output which are packaged in this subpackage.
-	awk '$1=="#" && $4==1 { print $3 }' <$tmpdir/out |
+	awk -v nf=$noflags '$1=="#" && (nf?$2:$4)==1 { print $3 }' <$tmpdir/out |
 		xargs -r --delimiter='\n' \
 		stat -c '%d,%i %n' |
 		sort -u >$tmpdir/iout
@@ -152,6 +165,22 @@ CppReq()
 	Verbose "$f: requires $(wc -l <$tmpdir/pf) packaged files"
 	# Canonical filenames, add to the list of already processed files:
 	join -o 2.2 $tmpdir/i{out,BPF} |sort -u -o $tmpdir/processed{,} -
+
+	# How we recognize pushes and pops in preprocessor output.
+	local ppcode
+	if [ -z "$noflags" ]; then
+		# When we have flags, we just use those flags.
+		ppcode='$1=="#" && $4==1 { Push($3) }
+			$1=="#" && $4==2 { Pop($3) }'
+	else
+		# Otherwise, we assume that lineno 1 means a push.
+		# How we do the pop is a bit of a mystery, and is too large
+		# to fit in the margin.  The heuristic is by no means perfect,
+		# but with the e2k lcc preprocessor, it seems to work well.
+		ppcode='NR==1 && $3==hdr { next }
+			$1=="#" && $2==1 { Push($3) }
+			$1=="#" && $2>=2 && $3 != Stack[SP] { Pop($3) }'
+	fi
 
 	# Track included files down to the first external file.
 	awk -v prog="$PROG" -v hdr="$f" -v pf="$tmpdir"/pf <$tmpdir/out >$tmpdir/req '
@@ -205,8 +234,7 @@ CppReq()
 				NeedPush[h] = 1
 			ExpectPush = h
 		}
-		$1=="#" && $4==1 { Push($3) }
-		$1=="#" && $4==2 { Pop($3) }
+		'"$ppcode"'
 		$1~/^#i/ { Include($2) }
 		END {
 			if (SP > 0)
